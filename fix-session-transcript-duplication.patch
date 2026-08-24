@@ -1,0 +1,81 @@
+From 2ad2352e00912b89aae32e81d203f80c2a3bf3d2 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Tue, 25 Aug 2026 01:19:13 +0200
+Subject: [PATCH] fix(session): prevent duplicate transcript history
+
+---
+ packages/core/src/session/store.ts | 14 ++++++++++++++
+ packages/core/tests/stores.test.ts | 21 +++++++++++++++++++++
+ packages/tui/src/App.tsx           |  2 +-
+ 3 files changed, 36 insertions(+), 1 deletion(-)
+
+diff --git a/packages/core/src/session/store.ts b/packages/core/src/session/store.ts
+index 42eeb81..f295408 100644
+--- a/packages/core/src/session/store.ts
++++ b/packages/core/src/session/store.ts
+@@ -99,6 +99,20 @@ export class SessionStore {
+     this.open().prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`).run(Date.now(), id);
+   }
+ 
++  /**
++   * Replace a session's transcript with the current in-memory conversation.
++   *
++   * Agent runtimes retain every message, so appending that array at the end of
++   * each turn duplicates the whole history. Replacing also faithfully records
++   * history after context compaction, which can rewrite older messages.
++   */
++  async replaceTranscript(id: string, messages: readonly Message[]): Promise<void> {
++    const now = Date.now();
++    const transcript = messages.map((message) => JSON.stringify({ type: "message", at: now, message }) + "\n").join("");
++    await writeFile(this.transcriptPath(id), transcript);
++    this.open().prepare(`UPDATE sessions SET updated_at = ? WHERE id = ?`).run(now, id);
++  }
++
+   async addUsage(id: string, usage: Usage): Promise<void> {
+     this.open()
+       .prepare(`UPDATE sessions SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?`)
+diff --git a/packages/core/tests/stores.test.ts b/packages/core/tests/stores.test.ts
+index 2bbed1e..35764c0 100644
+--- a/packages/core/tests/stores.test.ts
++++ b/packages/core/tests/stores.test.ts
+@@ -73,4 +73,25 @@ describe("SessionStore", () => {
+       store.close();
+     }
+   });
++
++  test("replaceTranscript keeps a runtime's full history from being appended twice", async () => {
++    const store = await SessionStore.create(join(dir, "replace.db"), join(dir, "replace-transcripts"));
++    try {
++      const s = await store.createSession({ cwd: "/repo", model: "openai:test" });
++      const firstTurn = [
++        { role: "user" as const, content: "hello" },
++        { role: "assistant" as const, content: "hi there" },
++      ];
++
++      await store.replaceTranscript(s.id, firstTurn);
++      await store.replaceTranscript(s.id, [...firstTurn, { role: "user", content: "another question" }]);
++
++      expect(await store.readTranscript(s.id)).toEqual([
++        ...firstTurn,
++        { role: "user", content: "another question" },
++      ]);
++    } finally {
++      store.close();
++    }
++  });
+ });
+diff --git a/packages/tui/src/App.tsx b/packages/tui/src/App.tsx
+index bc5b09d..91e28f3 100644
+--- a/packages/tui/src/App.tsx
++++ b/packages/tui/src/App.tsx
+@@ -228,7 +228,7 @@ export function App(props: TuiOptions) {
+       setRunning(false);
+       setContextTokens(estimateContextTokens("", rt.runtime!.agent.messages));
+       if (rt.sessions && rt.sessionId) {
+-        for (const m of rt.runtime!.agent.messages) await rt.sessions.appendMessage(rt.sessionId, m);
++        await rt.sessions.replaceTranscript(rt.sessionId, rt.runtime!.agent.messages);
+         if (entries().filter((e) => e.kind === "user").length === 1) {
+           await rt.sessions.setTitle(rt.sessionId, text.slice(0, 60));
+         }
+-- 
+2.51.1
